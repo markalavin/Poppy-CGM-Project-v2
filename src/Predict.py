@@ -1,195 +1,162 @@
 import torch
-import numpy as np
+import torch.nn as nn
 import pandas as pd
-from Model_Architecture import PoppyLSTM
-from pylibrelinkup import PyLibreLinkUp     # API to Libre 3 history
-
-# Returns Tensor (X) representing the merger and normalization of the CGM
-# data from "cgm_source" consisting of "context_samples" time intervals
-# and the Records (food, insulin, etc.) from "user_records".  That tensor
-# is then used to predict future Glucose levels:
-
-import torch
 import numpy as np
-import pandas as pd
-from pylibrelinkup import PyLibreLinkUp
+from Get_Prediction_Data import get_glucose_data_from_api, get_recent_records
+from Model_Architecture import PoppyLSTMModel
+from Application_Parameters import INPUT_SAMPLES, PREDICTION_SAMPLES, LOW_GLUCOSE_THRESHOLD, HIGH_GLUCOSE_THRESHOLD
 
 
-def get_latest_context(email, password, user_inputs=None, context_samples=48):
-    """
-    Connects to LibreLinkUp, fetches the latest 12h graph of glucose levels,
-    and prepares a normalized 48-sample 7-feature tensor for the model.
-    """
-    # 1. AUTHENTICATION & FETCH
-    client = PyLibreLinkUp(email=email, password=password)
-    client.authenticate()
+# 1. MODEL ARCHITECTURE
+# PyTorch needs this class definition to understand how to load the weights
+class PoppyLSTMModel(nn.Module):
+    def __init__(self, input_size=7, hidden_size=64, num_layers=2, output_size=12):
+        super(PoppyLSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
 
-    patient_list = client.get_patients()
-    if not patient_list:
-        raise Exception("Still no patients found. Double-check you accepted the invite in the app.")
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = self.fc(out[:, -1, :])  # Take the output of the last time step
+        return out
 
-    poppy = patient_list[0]
-    measurements = client.graph(patient_identifier=poppy)  # Returns ~last 12 hours
 
-    # 2. CONVERT TO DATAFRAME & CALCULATE TIME FEATURES
-    data = []
-    for m in measurements:
-        ts = pd.to_datetime(m.timestamp)
-        # Convert time of day to radians (24 hours = 2*pi)
-        seconds_in_day = ts.hour * 3600 + ts.minute * 60 + ts.second
-        day_radians = 2 * np.pi * (seconds_in_day / 86400.0)
+# 2. HELPER: DATA PREPARATION
+def merge_records_to_context(glucose_df, records_df):
+    merged_df = glucose_df.copy()
 
-        data.append({
-            'glucose': m.value,
-            'insulin': 0.0, 'meal': 0.0, 'minimeal': 0.0, 'karo': 0.0,
-            'sin_time': np.sin(day_radians),
-            'cos_time': np.cos(day_radians)
-        })
+    # Add Cyclic Time Features
+    minutes_into_day = merged_df['time'].dt.hour * 60 + merged_df['time'].dt.minute
+    merged_df['sin_time'] = np.sin(2 * np.pi * minutes_into_day / 1440)
+    merged_df['cos_time'] = np.cos(2 * np.pi * minutes_into_day / 1440)
 
-    df = pd.DataFrame(data).tail(context_samples).copy()
+    if records_df is not None and not records_df.empty:
+        pivoted = records_df.pivot_table(index='time', columns='record_type',
+                                         values='record_amount', aggfunc='sum').reset_index()
+        merged_df = pd.merge_asof(merged_df.sort_values('time'), pivoted.sort_values('time'),
+                                  on='time', direction='backward', tolerance=pd.Timedelta("5m"))
 
-    # 3. MERGE USER RECORDS (Inject entries into the very last row)
-    if user_inputs:
-        idx = df.index[-1]
-        for key, val in user_inputs.items():
-            if key in df.columns: df.at[idx, key] = val
+    # Force-create missing columns and fill NaNs
+    for col in ['insulin', 'meal', 'minimeal', 'karo']:
+        if col not in merged_df.columns:
+            merged_df[col] = 0.0
+    return merged_df.fillna(0.0)
 
-    # 4. NORMALIZATION (Must match your training script exactly)
-    df['glucose'] = (df['glucose'] - 50.0) / 350.0
-    df['insulin'] = df['insulin'] / 12.0
-    df[['meal', 'minimeal', 'karo']] = df[['meal', 'minimeal', 'karo']] / 50.0
 
-    # 5. TENSOR CONVERSION [Batch, TimeSteps, Features]
+def prepare_tensor(df):
     features = ['glucose', 'insulin', 'meal', 'minimeal', 'karo', 'sin_time', 'cos_time']
-    context_tensor = torch.tensor(df[features].values).float().unsqueeze(0)
+    df_norm = df.copy()
+    # Apply your custom scaling
+    df_norm['glucose'] = (df_norm['glucose'] - 50.0) / 350.0
+    df_norm['insulin'] = df_norm['insulin'] / 12.0
+    df_norm['karo'] = df_norm['karo'] / 2.0
+    df_norm['minimeal'] = df_norm['minimeal'] / 2.0
+    df_norm['meal'] = df_norm['meal'] / 50.0
 
-    return context_tensor
-
-def merge_records_to_context(glucose_df, records_list):
-    """
-    glucose_df: The 48 rows of [time, glucose] from the API.
-    records_list: The list of lists from your get_recent_records().
-    """
-    # 1. Convert user records to a DataFrame
-    # Expected format: [[timestamp, type, amount], ...]
-    records_df = pd.DataFrame(records_list, columns=['time', 'type', 'amount'])
-
-    # 2. Pivot types (insulin, meal, etc.) into their own columns
-    # This fills gaps with 0.0 so the model doesn't see 'NaN'
-    pivoted = records_df.pivot_table(
-        index='time',
-        columns='type',
-        values='amount',
-        aggfunc='sum'
-    ).fillna(0.0)
-
-    # 3. Perform a 'Time-Series Merge' (merge_asof)
-    # This aligns records to the nearest preceding 5-minute CGM timestamp
-    glucose_df['time'] = pd.to_datetime(glucose_df['time'])
-    pivoted.index = pd.to_datetime(pivoted.index)
-
-    final_df = pd.merge_asof(
-        glucose_df.sort_values('time'),
-        pivoted.sort_index(),
-        on='time',
-        direction='backward',
-        tolerance=pd.Timedelta("5m")
-    ).fillna(0.0)
-
-    return final_df
-
-def run_recurrent_inference(model, context_tensor, steps=12):
-    """
-    Takes a [1, 48, 7] context and predicts 'steps' into the future.
-    """
-    model.eval()
-    predictions = []
-    current_window = context_tensor.clone()  # [1, 48, 7]
-
-    with torch.no_grad():
-        for _ in range(steps):
-            # 1. Predict the next 5-minute glucose value
-            # The model returns a normalized value (e.g., 0.3)
-            pred_scaled = model(current_window)
-            predictions.append(pred_scaled.item())
-
-            # 2. Prepare the 'Future Row' for the next step
-            # We must update the Sine/Cosine features for the new time point
-            new_row = current_window[:, -1:, :].clone()  # Copy the last row
-            new_row[0, 0, 0] = pred_scaled  # Set predicted glucose
-
-            # Reset Insulin/Carbs to 0 for the 'future' steps
-            # (Unless you want to 'what-if' a meal here)
-            new_row[0, 0, 1:5] = 0
-
-            # Update Time Features (Shift 5 minutes forward)
-            # This prevents the model from getting 'stuck' in the current time
-            new_row = update_time_features(new_row)
-
-            # 3. Slide the Window
-            # Drop the oldest sample (index 0) and append the new prediction
-            current_window = torch.cat((current_window[:, 1:, :], new_row), dim=1)
-
-    return predictions
+    data_array = df_norm[features].values.astype(np.float32)
+    return torch.tensor(data_array).unsqueeze(0)
 
 
-def update_time_features(row_tensor):
-    """
-    Helper to advance the Sine/Cosine features by 5 minutes (1/288th of a day).
-    """
-    # Current Sine/Cosine values
-    sin_val = row_tensor[0, 0, 5].item()
-    cos_val = row_tensor[0, 0, 6].item()
-
-    # Calculate current angle in radians
-    current_angle = np.arctan2(sin_val, cos_val)
-
-    # Advance by 5 minutes (2*pi / 288 steps per day)
-    next_angle = current_angle + (2 * np.pi / 288.0)
-
-    row_tensor[0, 0, 5] = np.sin(next_angle)
-    row_tensor[0, 0, 6] = np.cos(next_angle)
-    return row_tensor
-
-def display_forecast(predictions_scaled):
-    """
-    DISPLAY/UI:
-    Converts decimals back to mg/dL and prints/plots the results.
-    """
-    print("\n--- Poppy's 60-Minute Forecast ---")
-    for i, p in enumerate(predictions_scaled):
-        mgdl = (p * 350) + 50
-        time_ahead = (i + 1) * 5
-        print(f"+{time_ahead} min: {mgdl:.1f} mg/dL")
-
+# 3. MAIN EXECUTION
 def Predict():
-    email = "markalavin@gmail.com"
-    password = "my$Poppy$Dog1"
-    context_tensor = get_latest_context(email, password, user_inputs=None, context_samples=48)
+    print("--- Starting Predict() ---")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Step 1: Device detected as {device}")
 
-    # 1. Initialize the architecture (must match your training setup)
-    model = PoppyLSTM(input_size=7)
+    # Initialize model
+    model = PoppyLSTMModel(input_size=7, output_size=PREDICTION_SAMPLES).to(device)
+    try:
+        import os
 
-    # 2. Load the weights from your saved file
-    # map_location ensures it works even if you move between CPU and GPU
-    model.load_state_dict(torch.load("poppy_model_best.pth", map_location=torch.device('cpu')))
+        # Create an absolute path to the file
+        file_name = 'poppy_model_best.pth'
+        absolute_path = os.path.join(os.getcwd(), file_name)
 
-    # 3. Set to evaluation mode
-    # This is critical to turn off dropout/batch norm layers for prediction
-    model.eval()
+        print(f"Checking absolute path: {absolute_path}")
 
-    print("Model successfully loaded and ready for testing!")
+        if os.path.exists(absolute_path):
+            print("Python sees the file! Loading now...")
+            checkpoint = torch.load(absolute_path, map_location=device)
+            model.load_state_dict(checkpoint)
+        else:
+            print("Python STILL cannot see the file at that path.")
 
-    predictions = run_recurrent_inference(model, context_tensor, steps=12)
+        model.eval()
+        print("Step 2: Model weights loaded successfully.")
+    except FileNotFoundError:
+        print("STOP: 'poppy_model_best.pth' NOT FOUND in src/ folder.")
+        return
 
-    # Assuming 'results' is your list of 12 normalized predictions
-    print("\n--- Poppy's 60-Minute Forecast ---")
-    for i, pred in enumerate( predictions ):
-        # Reverse the Min-Max scaling
-        mgdl = (pred * ( 400 - 50 ) ) + 50
+    # Data Acquisition
+    print("Step 3: Fetching glucose data from API...")
+    current_time = pd.Timestamp.now()
+    glucose_df = get_glucose_data_from_api(email='markalavin@gmail.com', password='my$Poppy$Dog1')
 
-        time_ahead = (i + 1) * 5
-        print(f"+{time_ahead} min: {mgdl:.1f} mg/dL")
+    print(f"Step 4: API returned {len(glucose_df)} rows of glucose data.")
+    if len(glucose_df) < INPUT_SAMPLES:
+        print(f"STOP: Not enough data points (Need {INPUT_SAMPLES}, got {len(glucose_df)}).")
+        return
+
+    print("Step 5: Fetching recent records (insulin/meals)...")
+    records_df = get_recent_records(current_time)
+
+    print("Step 6: Merging data streams...")
+    merged_df = merge_records_to_context(glucose_df, records_df)
+
+    print("Step 7: Preparing input tensor...")
+    input_tensor = prepare_tensor(merged_df).to(device)
+
+    print("Step 8: Running Inference...")
+    with torch.no_grad():
+        prediction = model(input_tensor)
+
+    print("Step 9: De-normalizing results...")
+    final_forecast = (prediction.cpu().numpy() * 350.0) + 50.0
+
+    print(f"\nSUCCESS! Poppy's 120-Minute Forecast (5-min intervals):")
+    # This will now print all (24) predicted points
+    print(final_forecast.flatten().round(1))
+
+    plot_forecast( merged_df, final_forecast.flatten() )
+
+import matplotlib.pyplot as plt
+
+
+def plot_forecast(recent_df, forecast_array):
+    plt.figure(figsize=(12, 6))
+
+    # 1. Plot the Actual History
+    plt.plot(recent_df['time'], recent_df['glucose'],
+             label='Actual History (Past 6h)', color='blue', marker='o', markersize=3)
+
+    # 2. Setup Forecast Times
+    last_time = recent_df['time'].iloc[-1]
+    forecast_times = [last_time + pd.Timedelta(minutes=5 * (i + 1)) for i in range(len(forecast_array))]
+
+    # 3. Plot the Forecast
+    plt.plot(forecast_times, forecast_array,
+             label='LSTM Forecast (Next 2h)', color='red', linestyle='--', marker='s', markersize=3)
+
+    # 4. Add Canine-Specific Thresholds
+    plt.axhline(y=LOW_GLUCOSE_THRESHOLD, color='green', linestyle=':', label=f'Low Target ({LOW_GLUCOSE_THRESHOLD})')
+    plt.axhline(y=HIGH_GLUCOSE_THRESHOLD, color='orange', linestyle=':', label=f'High Target ({HIGH_GLUCOSE_THRESHOLD})')
+
+    # NEW: Create a dynamic, timestamped title
+    formatted_time = last_time.strftime('%Y-%m-%d %H:%M')
+    plt.title(f"Poppy's Glucose Forecast\nLast Reading: {formatted_time}")
+
+    # Formatting
+    plt.xlabel("Time")
+    plt.ylabel("Glucose (mg/dL)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+
+    # Optional: Save the plot automatically
+    # plt.savefig(f"forecast_{last_time.strftime('%Y%m%d_%H%M')}.png")
+
+    plt.show()
 
 if __name__ == "__main__":
     Predict()
