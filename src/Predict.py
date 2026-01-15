@@ -5,6 +5,7 @@ import numpy as np
 from Get_Prediction_Data import get_glucose_data_from_api, get_recent_records
 from Model_Architecture import PoppyLSTMModel
 from Application_Parameters import INPUT_SAMPLES, PREDICTION_SAMPLES, LOW_GLUCOSE_THRESHOLD, HIGH_GLUCOSE_THRESHOLD
+from Logging import log_prediction
 
 
 # 1. MODEL ARCHITECTURE
@@ -113,11 +114,22 @@ def Predict():
     print("Step 9: De-normalizing results...")
     final_forecast = (prediction.cpu().numpy() * 350.0) + 50.0
 
+    # Save this prediction in the log file for later comparison with "actuals":
+    log_prediction(
+        current_glucose=merged_df['glucose'].iloc[-1],
+        forecast_array=final_forecast.flatten() )
+    #    insulin=insulin_input,  # These come from your user prompts
+    #    carbs=meal_input
+
+
+
     print(f"\nSUCCESS! Poppy's 120-Minute Forecast (5-min intervals):")
     # This will now print all (24) predicted points
     print(final_forecast.flatten().round(1))
 
     plot_forecast( merged_df, final_forecast.flatten() )
+
+
 
 import matplotlib.pyplot as plt
 

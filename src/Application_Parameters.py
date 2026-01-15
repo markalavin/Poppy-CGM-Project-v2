@@ -1,5 +1,8 @@
 # Application_Parameters.py
 
+# Application version for logging and tracking
+APP_VERSION = "1.0.2"  # Increment this when you change architecture or training logic
+
 DATA_INTERVAL_MINUTES = 5
 
 # Input: 6 hours of history
@@ -21,3 +24,6 @@ HIGH_GLUCOSE_THRESHOLD = 250
 # Parameters specifying range of readings from Libre 3:
 GLUCOSE_LOWER_LIMIT = 50
 GLUCOSE_UPPER_LIMIT = 400
+
+# Parameters for gathering Prediction histories
+PREDICTION_HISTORY_FILE = '../data/prediction_history.csv'
