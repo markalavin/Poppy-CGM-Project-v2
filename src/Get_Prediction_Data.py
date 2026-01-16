@@ -3,7 +3,7 @@
 
 import pandas as pd
 import numpy as np
-from datetime import timedelta
+from datetime import timedelta, datetime
 from Application_Parameters import INPUT_SAMPLES
 
 # This function returns information about Records of events like meals, insulin, etc. in
@@ -30,6 +30,15 @@ def ask_number( question : str ) -> int:
         except:
             pass
 
+def ask_minutes_ago( as_of_time ) -> int:
+    question = "How many minutes ago or HH:MM  "
+    while True:
+        try:
+            response = input( question )
+            return parse_time_input( response, as_of_time )
+        except:
+            pass
+
 # Construct and return a dataframe containing a single "record event":
 
 def record( time : pd.Timestamp, record_type: str, record_amount : int ) -> pd.DataFrame:
@@ -49,34 +58,34 @@ def get_recent_records( as_of_time : pd.Timestamp ) -> pd.DataFrame:
     print("get_recent_records as_of_time", as_of_time )
     result_df = pd.DataFrame( columns = [ 'time', 'record_type', 'record_amount' ] )
 
-    while ask_yes_no( f"Any more records (meals, insulin, etc.) in four hours leading up to {as_of_time}?" ):
+    while ask_yes_no( f"Any more records (meals, insulin, etc.) in six hours leading up to {as_of_time}?" ):
 
         if ask_yes_no( f"Meal?" ):
-            minutes_ago = ask_number( f"How many minutes ago?" )
+            minutes_ago = ask_minutes_ago( as_of_time )
             meal_time = as_of_time - timedelta( minutes = minutes_ago )
             meal_amount = 9  # Hardwire for now
             result_df = concatenate( result_df, record( meal_time, 'meal', meal_amount ) )
 
         elif ask_yes_no( f"insulin" ):
-            minutes_ago = ask_number( f"How many minutes ago?" )
+            minutes_ago = ask_minutes_ago( as_of_time )
             insulin_time = as_of_time - timedelta( minutes = minutes_ago )
             insulin_amount = ask_number( f"How many units?" )
             result_df = concatenate( result_df, record( insulin_time, 'insulin', insulin_amount ) )
 
         elif ask_yes_no(f"minimeal?"):
-            minutes_ago = ask_number(f"How many minutes ago?")
+            minutes_ago = ask_minutes_ago( as_of_time )
             minimeal_time = as_of_time - timedelta(minutes=minutes_ago)
             minimeal_amount = 2  # Hardwire for now
             result_df = concatenate( result_df, record( minimeal_time, 'minimeal', minimeal_amount ) )
 
         elif ask_yes_no( f"karo?" ):
-            minutes_ago = ask_number( f"How many minutes ago?" )
+            minutes_ago = ask_minutes_ago( as_of_time )
             karo_time = as_of_time - timedelta( minutes = minutes_ago )
             karo_amount = 1  # Hardwire for now
             result_df = concatenate( result_df, record( karo_time, 'karo', karo_amount ) )
 
         elif ask_yes_no( f"exercise?" ):
-            minutes_ago = ask_number(f"How many minutes ago?")
+            minutes_ago = ask_minutes_ago( as_of_time )
             exercise_time = as_of_time - timedelta(minutes=minutes_ago)
             exercise_amount = 15  # Hardwire for now
             result_df = concatenate( result_df, record( exercise_time, 'exercise', exercise_amount ) )
@@ -120,4 +129,39 @@ def get_glucose_data_from_api(email, password):
     # We only need the most recent 72 samples (6 hours) for the model
     return df.tail(INPUT_SAMPLES).reset_index(drop=True)
 
-# ### print( "result of get_recent_records:\n", get_recent_records( pd.Timestamp.now() ) )
+
+def parse_time_input(user_input, reference_time):
+    """
+    Returns 'minutes ago' relative to reference_time.
+    Handles raw integers (minutes ago) or HH:MM strings (absolute time):
+    """
+    user_input = user_input.strip().lower()
+
+    # Check if it's a simple number (minutes ago)
+    if user_input.isdigit():
+        return int(user_input)
+
+    # Check if it's a timestamp (HH:MM)
+    try:
+        # Standardize 6:30p or 18:30 formats
+        if 'p' in user_input:
+            input_dt = datetime.strptime(user_input.replace('p', ''), "%H:%M")
+            if input_dt.hour < 12: input_dt += timedelta(hours=12)
+        elif 'a' in user_input:
+            input_dt = datetime.strptime(user_input.replace('a', ''), "%H:%M")
+        else:
+            input_dt = datetime.strptime(user_input, "%H:%M")
+
+        # Align to the reference date
+        event_time = reference_time.replace(hour=input_dt.hour, minute=input_dt.minute, second=0, microsecond=0)
+
+        # If the event time is in the future compared to reference, it was likely yesterday
+        if event_time > reference_time:
+            event_time -= timedelta(days=1)
+
+        diff = reference_time - event_time
+        return int(diff.total_seconds() / 60)
+    except ValueError as e:
+        print(f"Error message: {e}")
+        return None
+
