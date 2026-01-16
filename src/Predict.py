@@ -2,13 +2,15 @@ import torch
 import torch.nn as nn
 import pandas as pd
 import numpy as np
-from Get_Prediction_Data import get_glucose_data_from_api, get_recent_records
 from Model_Architecture import PoppyLSTMModel
-from Application_Parameters import INPUT_SAMPLES, PREDICTION_SAMPLES, LOW_GLUCOSE_THRESHOLD, HIGH_GLUCOSE_THRESHOLD
+from Application_Parameters import INPUT_SAMPLES, PREDICTION_SAMPLES, CGM_MIN, CGM_MAX, CGM_RANGE
 from Logging import log_prediction
+from datetime import datetime
+from Get_Prediction_Data import get_glucose_data_from_api, get_recent_records, parse_time_input
+import glob
+import os
 
-
-# 1. MODEL ARCHITECTURE
+# 1. MODEL ARCHITECTURECGM
 # PyTorch needs this class definition to understand how to load the weights
 class PoppyLSTMModel(nn.Module):
     def __init__(self, input_size=7, hidden_size=64, num_layers=2, output_size=12):
@@ -59,35 +61,49 @@ def prepare_tensor(df):
 
 
 # 3. MAIN EXECUTION
-def Predict():
+import glob
+import os
+
+
+# 3. MAIN EXECUTION
+def Predict(prediction_time=None, device_arg=None):
     print("--- Starting Predict() ---")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Step 1: Device detected as {device}")
+    if device_arg:
+        device = torch.device(device_arg)
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Step 1: Using device: {device}")
 
-    # Initialize model
+    # Initialize model architecture
     model = PoppyLSTMModel(input_size=7, output_size=PREDICTION_SAMPLES).to(device)
+
     try:
-        import os
+        # Step 2: Automatically find the LATEST model file
+        # This looks for any file starting with 'poppy_model_' in the src/ folder
+        search_pattern = os.path.join("src", "poppy_model_*.pth*")
+        list_of_files = glob.glob(search_pattern)
 
-        # Create an absolute path to the file
-        file_name = 'poppy_model_best.pth'
-        absolute_path = os.path.join(os.getcwd(), file_name)
+        if not list_of_files:
+            # Fallback check if the user is running from inside /src already
+            list_of_files = glob.glob("poppy_model_*.pth*")
 
-        print(f"Checking absolute path: {absolute_path}")
+        if list_of_files:
+            # Get the file with the most recent creation time
+            latest_model = max(list_of_files, key=os.path.getctime)
+            print(f"Step 2: Automatically loading newest model: {latest_model}")
 
-        if os.path.exists(absolute_path):
-            print("Python sees the file! Loading now...")
-            checkpoint = torch.load(absolute_path, map_location=device)
+            checkpoint = torch.load(latest_model, map_location=device)
             model.load_state_dict(checkpoint)
+            model.eval()
+            print("Model weights loaded successfully.")
         else:
-            print("Python STILL cannot see the file at that path.")
+            print("STOP: No files matching 'poppy_model_*.pth' found in src/ folder.")
+            return
 
-        model.eval()
-        print("Step 2: Model weights loaded successfully.")
-    except FileNotFoundError:
-        print("STOP: 'poppy_model_best.pth' NOT FOUND in src/ folder.")
+    except Exception as e:
+        print(f"An error occurred during model loading: {type(e).__name__}")
+        print(f"Error message: {e}")
         return
-
     # Data Acquisition
     print("Step 3: Fetching glucose data from API...")
     current_time = pd.Timestamp.now()
@@ -150,8 +166,8 @@ def plot_forecast(recent_df, forecast_array):
              label='LSTM Forecast (Next 2h)', color='red', linestyle='--', marker='s', markersize=3)
 
     # 4. Add Canine-Specific Thresholds
-    plt.axhline(y=LOW_GLUCOSE_THRESHOLD, color='green', linestyle=':', label=f'Low Target ({LOW_GLUCOSE_THRESHOLD})')
-    plt.axhline(y=HIGH_GLUCOSE_THRESHOLD, color='orange', linestyle=':', label=f'High Target ({HIGH_GLUCOSE_THRESHOLD})')
+    plt.axhline(y=CGM_MIN, color='green', linestyle=':', label=f'Low Target ({CGM_MIN})')
+    plt.axhline(y=CGM_MAX, color='orange', linestyle=':', label=f'High Target ({CGM_MAX})')
 
     # NEW: Create a dynamic, timestamped title
     formatted_time = last_time.strftime('%Y-%m-%d %H:%M')
