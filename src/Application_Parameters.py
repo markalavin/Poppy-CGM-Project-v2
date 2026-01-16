@@ -21,9 +21,14 @@ NUM_LAYERS = 2
 LOW_GLUCOSE_THRESHOLD = 150
 HIGH_GLUCOSE_THRESHOLD = 250
 
-# Parameters specifying range of readings from Libre 3:
-GLUCOSE_LOWER_LIMIT = 50
-GLUCOSE_UPPER_LIMIT = 400
+# Parameters specifying range of readings from Libre 3 (### depracate ###)
+# ### GLUCOSE_LOWER_LIMIT = 50
+# ### GLUCOSE_UPPER_LIMIT = 400
 
 # Parameters for gathering Prediction histories
 PREDICTION_HISTORY_FILE = '../data/prediction_history.csv'
+
+# Abbot FreeStyle Libre 3 Continuous Glucose Monitor parameters
+CGM_MIN = 50.0
+CGM_MAX = 400.0
+CGM_RANGE = CGM_MAX - CGM_MIN
