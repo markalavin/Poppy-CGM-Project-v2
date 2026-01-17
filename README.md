@@ -51,21 +51,21 @@ To first order, glucose level prediction is a standard time-series problem based
   <dt><code>src/Create_Windows.py</code></dt>
   <dd>Gather CGM and Record data for Training</dd>
   <dt><code>src/Get_Prediction_Data.py</code></dt>
-  <dd>Gathers CGM data from ```pylibrelinkup``` and Record data from user input and combine for Prediction.</dd>
+  <dd>Gathers CGM data from <code>pylibrelinkup</code> and Record data from user input and combine for Prediction.</dd>
   <dt><code>src/Logging.py</code></dt>
   <dd>Saves result of Predictions in log CSV file</dd>
   <dt><code>src/Merge_Poppy_data.py</code></dt>
-  <dd>Combines CGM and Record data using Pandas' ```merge...asof``` capability</dd>
+  <dd>Combines CGM and Record data using Pandas' <code>merge...asof</code> capability</dd>
   <dt><code>src/Model_Architecture.py</code></dt>
   <dd></dd>
   <dt><code>src/Predict.py</code></dt>
-  <dd>Predict glucose data after "now" or specified time using information gathered from ```pylibrelinkup``` and user input.</dd>
+  <dd>Predict glucose data after "now" or specified time using information gathered from <code>pylibrelinkup</code> and user input.</dd>
   <dt><code>src/Process_CGM_Data.py</code></dt>
-  <dd></dd>
+  <dd>Processes and analyzes CGM data from .csv file</dd>
   <dt><code>src/Process_Report_Data.py</code></dt>
-  <dd></dd>
+  <dd>Processes Report data from .csv file</dd>
   <dt><code>src/Train_LSTM.py</code></dt>
-  <dd></dd>
+  <dd>Perform training on LSTM model based on input tensors</dd>
   <dt><code>src/poppy_model_best.pth.saved</code></dt>
   <dd>Current saved model of Poppy's glucose behavior</dd>
 </dl>
