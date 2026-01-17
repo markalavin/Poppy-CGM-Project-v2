@@ -23,7 +23,7 @@ To first order, glucose level prediction is a standard time-series problem based
 #### Model Structure
 #### Model Training
 ## Prediction
-
+[Label](https://github.com/markalavin/Poppy-CGM-Project/blob/main/data/Poppy_Forecast_2026_01_16_20_35.png)
 # Usage
 ## Code Manufacture
 ## Training
