@@ -32,7 +32,9 @@ Prediction uses similar data and methods to the model training:  Given a predict
 # 4. Usage
 The project has been set up so that it could be viewed and even tried out by others.  There is one qualification:  At the moment, the only repository of CGM data I have access to is Poppy's.  I have set things up so that during training or prediction, you'll be accessing Poppy's data, which run from November 2025 through early January 2026.  In any case, if you run into problems trying to set up or use the project, do no hesitate to contact me via the GitHub project 
 ## 4.1. Code Manufacture
-To set up the code for your own use, you will have to follow these steps.  
+I developed the code (with extensive help from Gemini) using the PyCharm Python IDE.  You should be able to use any Python environment such as Jupyter or even just a stand-alone interpreter.  Here are the steps to follow (this is on Windows; adapt as needed for Linux, MacOS, etc.):
+1.  Set up a directory to hold the project.
+2.  
 ## 4.2. Training
 ## 4.3. Prediction
 ![](https://github.com/markalavin/Poppy-CGM-Project/blob/main/data/Poppy_Forecast_2026_01_16_20_35.png)
