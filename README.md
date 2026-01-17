@@ -16,13 +16,19 @@ The project was implemented with a Python 3 program on a Lenovo P1 laptop runnin
 
 ## Modelling with LSTM
 To first order, glucose level prediction is a standard time-series problem based on the CGM data and "record" data, where we're given a "context" time series (the previous six hours of CGM data) and want to extend the time series with two hours of *predicted* CGM data.  There are many machine learning techniques for predicting time-series, but we used Artificial Neural Networks (ANNs), specifically, Long Short-Term Memory (LSTM) recurrent neural networks.  The LSTM consists of a series of modules that the sequential input data flow through and that exchange information to predicate the output, namely a series of predicted glucose levels.  Using PyTorch, we could implement an ANN consisting of two LSTMs followed by a fully-connected network that produces the output "predicted continuation" of the time series.
+
 ### Data Input
 #### CGM data API
+The CGM data are first acquired from the Abbot LibreView server, downloaded as .csv files, one for each 5-minute glucose sample.  The CGM data are continuously and automatically updated by the Libre 3 app, and accessed by the Python ```pylibrelinkup``` package available through ```pip```.
 #### "Record" data API
+#### Input Tensors
 ### Machine Learning
 #### Model Structure
 #### Model Training
+
 ## Prediction
+
+
 # Usage
 ## Code Manufacture
 ## Training
