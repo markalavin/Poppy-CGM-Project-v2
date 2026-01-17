@@ -25,9 +25,7 @@ The CGM data are first acquired from the Abbot LibreView server, downloaded as .
 #### Input Tensors
 The last step in the data chain, whether for training or prediction, is to merge the CGM and Record data aligned in the time axis.  These merged data are then converted to a PyTorch *tensor* that consists of one row per input sample (approximately 19,000 so far) and seven columns ```['Glucose', 'Insulin', 'Meal', 'Minimeal', 'Karo', 'Sin_T', 'Cos_T']```, where "minimeal" and "karo" indicate the amount (currently fixed) of food or karo (sugar) syrup given to Poppy according to a report.   'Sin_T' and 'Cos_T' are the sin and cosine of the time of day (in hours since midnight) that the sample was taken.  All quantities get normalized during the dadta preparation to lie in the range [0.0, 1.0].  Note that for the vast majority of samples, there is only glucose data and thus all columns except 'Glucose', 'Sin_T' and 'Cos_T' are 0s.
 ### Machine Learning
-#### Model Structure
-#### Model Training
-
+The LSTM model that predicts future glucose levels (for two hours or 24 five-minute samples) based on the preceding six hours or 72 samples glucose levels and record data (meals, insulin, etc.) uses standard neural network training techniques:  Input data are broken up into 32 sample *batches* and then two hundred batches are processed.  For each batch, the 72 "input" or "context" samples are used to predict the subsequent 24 samples, the result is compared with the input "actuals", and the amount and gradient of the error between them is used to adjust the internal state of the model (weights associated with the elements of the LSTM neural net) until minimum error is achieved.
 ## Prediction
 
 
