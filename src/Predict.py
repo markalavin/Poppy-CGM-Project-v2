@@ -1,17 +1,21 @@
+import argparse
 import torch
 import torch.nn as nn
 import pandas as pd
 import numpy as np
-from Model_Architecture import PoppyLSTMModel
-from Application_Parameters import INPUT_SAMPLES, PREDICTION_SAMPLES, CGM_MIN, CGM_MAX, CGM_RANGE
-from Logging import log_prediction
-from datetime import datetime
-from Get_Prediction_Data import get_glucose_data_from_api, get_recent_records, parse_time_input
+import matplotlib.pyplot as plt
 import glob
 import os
+from datetime import datetime, timedelta
 
-# 1. MODEL ARCHITECTURECGM
-# PyTorch needs this class definition to understand how to load the weights
+from Utilities import time_spec
+from Validate import validate_prediction
+from Logging import log_prediction
+from Get_Prediction_Data import get_glucose_data_from_api, get_recent_records
+from Application_Parameters import INPUT_SAMPLES, PREDICTION_SAMPLES, CGM_MIN, CGM_MAX
+
+
+# 1. MODEL ARCHITECTURE
 class PoppyLSTMModel(nn.Module):
     def __init__(self, input_size=7, hidden_size=64, num_layers=2, output_size=12):
         super(PoppyLSTMModel, self).__init__()
@@ -20,15 +24,13 @@ class PoppyLSTMModel(nn.Module):
 
     def forward(self, x):
         out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :])  # Take the output of the last time step
+        out = self.fc(out[:, -1, :])
         return out
 
 
-# 2. HELPER: DATA PREPARATION
+# 2. DATA HELPERS
 def merge_records_to_context(glucose_df, records_df):
     merged_df = glucose_df.copy()
-
-    # Add Cyclic Time Features
     minutes_into_day = merged_df['time'].dt.hour * 60 + merged_df['time'].dt.minute
     merged_df['sin_time'] = np.sin(2 * np.pi * minutes_into_day / 1440)
     merged_df['cos_time'] = np.cos(2 * np.pi * minutes_into_day / 1440)
@@ -39,7 +41,6 @@ def merge_records_to_context(glucose_df, records_df):
         merged_df = pd.merge_asof(merged_df.sort_values('time'), pivoted.sort_values('time'),
                                   on='time', direction='backward', tolerance=pd.Timedelta("5m"))
 
-    # Force-create missing columns and fill NaNs
     for col in ['insulin', 'meal', 'minimeal', 'karo']:
         if col not in merged_df.columns:
             merged_df[col] = 0.0
@@ -49,142 +50,147 @@ def merge_records_to_context(glucose_df, records_df):
 def prepare_tensor(df):
     features = ['glucose', 'insulin', 'meal', 'minimeal', 'karo', 'sin_time', 'cos_time']
     df_norm = df.copy()
-    # Apply your custom scaling
     df_norm['glucose'] = (df_norm['glucose'] - 50.0) / 350.0
     df_norm['insulin'] = df_norm['insulin'] / 12.0
     df_norm['karo'] = df_norm['karo'] / 2.0
     df_norm['minimeal'] = df_norm['minimeal'] / 2.0
     df_norm['meal'] = df_norm['meal'] / 50.0
-
     data_array = df_norm[features].values.astype(np.float32)
     return torch.tensor(data_array).unsqueeze(0)
 
 
-# 3. MAIN EXECUTION
-import glob
-import os
-
-
-# 3. MAIN EXECUTION
-def Predict(prediction_time=None, device_arg=None):
+# 3. MAIN PREDICT FUNCTION
+def Predict(prediction_time=None, device_arg=None, validate=False):
     print("--- Starting Predict() ---")
-    if device_arg:
-        device = torch.device(device_arg)
-    else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Step 1: Using device: {device}")
+    device = torch.device(device_arg if device_arg else ('cuda' if torch.cuda.is_available() else 'cpu'))
 
-    # Initialize model architecture
-    model = PoppyLSTMModel(input_size=7, output_size=PREDICTION_SAMPLES).to(device)
-
-    try:
-        # Step 2: Automatically find the LATEST model file
-        # This looks for any file starting with 'poppy_model_' in the src/ folder
-        search_pattern = os.path.join("src", "poppy_model_*.pth*")
-        list_of_files = glob.glob(search_pattern)
-
-        if not list_of_files:
-            # Fallback check if the user is running from inside /src already
-            list_of_files = glob.glob("poppy_model_*.pth*")
-
-        if list_of_files:
-            # Get the file with the most recent creation time
-            latest_model = max(list_of_files, key=os.path.getctime)
-            print(f"Step 2: Automatically loading newest model: {latest_model}")
-
-            checkpoint = torch.load(latest_model, map_location=device)
-            model.load_state_dict(checkpoint)
-            model.eval()
-            print("Model weights loaded successfully.")
-        else:
-            print("STOP: No files matching 'poppy_model_*.pth' found in src/ folder.")
+    # Validation Guardrails
+    if validate:
+        p_time = pd.to_datetime(prediction_time)
+        if p_time < datetime.now() - timedelta(hours=12):
+            print("🛑 Error: Cannot validate. API only provides the last 12 hours.")
+            return
+        if p_time > datetime.now() - timedelta(hours=2):
+            print("🛑 Error: Validation requires 2 hours of 'actual' data. Too soon!")
             return
 
-    except Exception as e:
-        print(f"An error occurred during model loading: {type(e).__name__}")
-        print(f"Error message: {e}")
+    # Load Model
+    model = PoppyLSTMModel(input_size=7, output_size=PREDICTION_SAMPLES).to(device)
+    search_pattern = os.path.join("src", "poppy_model_*.pth*")
+    list_of_files = glob.glob(search_pattern) or glob.glob("poppy_model_*.pth*")
+
+    if not list_of_files:
+        print("🛑 No model file found.")
         return
-    # Data Acquisition
-    print("Step 3: Fetching glucose data from API...")
-    current_time = pd.Timestamp.now()
+
+    latest_model = max(list_of_files, key=os.path.getctime)
+    model.load_state_dict(torch.load(latest_model, map_location=device))
+    model.eval()
+
+    # Data Fetching
+    # 1. Establish the "Anchor" - use prediction_time if provided, else use current time
+    anchor_time = pd.Timestamp(prediction_time) if prediction_time else pd.Timestamp.now()
+
+    # 2. Fetch glucose data and filter it so we don't "see the future"
+    print(f"Step 3: Fetching glucose data relative to {anchor_time}...")
     glucose_df = get_glucose_data_from_api(email='markalavin@gmail.com', password='my$Poppy$Dog1')
 
-    print(f"Step 4: API returned {len(glucose_df)} rows of glucose data.")
-    if len(glucose_df) < INPUT_SAMPLES:
-        print(f"STOP: Not enough data points (Need {INPUT_SAMPLES}, got {len(glucose_df)}).")
-        return
+    # Filter glucose_df to only include readings UP TO the anchor_time
+    glucose_df = glucose_df[glucose_df['time'] <= anchor_time].tail(INPUT_SAMPLES)
 
-    print("Step 5: Fetching recent records (insulin/meals)...")
-    records_df = get_recent_records(current_time)
+    print(f"Step 5: Fetching recent records leading up to {anchor_time}...")
+    # Pass anchor_time here so the console prompt asks about the correct 6-hour window
+    records_df = get_recent_records(anchor_time)
 
+    # Step 6: Merging
     print("Step 6: Merging data streams...")
     merged_df = merge_records_to_context(glucose_df, records_df)
 
+    # Step 7: Preparing input tensor
+    # Ensure this line is NOT indented inside an 'if' or 'try' block
+    # unless Step 8 is also inside that same block.
     print("Step 7: Preparing input tensor...")
-    input_tensor = prepare_tensor(merged_df).to(device)
 
+    # We use .tail(INPUT_SAMPLES) to get the exact window needed
+    input_tensor = prepare_tensor(merged_df.tail(INPUT_SAMPLES)).to(device)
+
+    # Step 8: Running Inference
     print("Step 8: Running Inference...")
     with torch.no_grad():
-        prediction = model(input_tensor)
+        prediction_tensor = model(input_tensor)
 
-    print("Step 9: De-normalizing results...")
-    final_forecast = (prediction.cpu().numpy() * 350.0) + 50.0
+    # De-normalize
+    forecast_array = (prediction_tensor.cpu().numpy().flatten() * 350.0) + 50.0
 
-    # Save this prediction in the log file for later comparison with "actuals":
-    log_prediction(
-        current_glucose=merged_df['glucose'].iloc[-1],
-        forecast_array=final_forecast.flatten() )
-    #    insulin=insulin_input,  # These come from your user prompts
-    #    carbs=meal_input
+    # Log the prediction
+    log_prediction(current_glucose=merged_df['glucose'].iloc[-1], forecast_array=forecast_array)
 
+    # Validate if requested
+    actuals_results = None
+    if validate:
+        actuals_results = validate_prediction(prediction_time, forecast_array,
+                                              email='markalavin@gmail.com',
+                                              password='my$Poppy$Dog1')
 
-
-    print(f"\nSUCCESS! Poppy's 120-Minute Forecast (5-min intervals):")
-    # This will now print all (24) predicted points
-    print(final_forecast.flatten().round(1))
-
-    plot_forecast( merged_df, final_forecast.flatten() )
+    # Plot
+    plot_forecast(merged_df, forecast_array, actuals_results)
 
 
-
-import matplotlib.pyplot as plt
-
-
-def plot_forecast(recent_df, forecast_array):
+def plot_forecast(recent_df, forecast_array, actuals_results=None):
     plt.figure(figsize=(12, 6))
-
-    # 1. Plot the Actual History
-    plt.plot(recent_df['time'], recent_df['glucose'],
-             label='Actual History (Past 6h)', color='blue', marker='o', markersize=3)
-
-    # 2. Setup Forecast Times
     last_time = recent_df['time'].iloc[-1]
     forecast_times = [last_time + pd.Timedelta(minutes=5 * (i + 1)) for i in range(len(forecast_array))]
 
-    # 3. Plot the Forecast
-    plt.plot(forecast_times, forecast_array,
-             label='LSTM Forecast (Next 2h)', color='red', linestyle='--', marker='s', markersize=3)
+    plt.plot(recent_df['time'], recent_df['glucose'], label='Actual History', color='blue', marker='o', markersize=3)
+    plt.plot(forecast_times, forecast_array, label='LSTM Forecast', color='red', linestyle='--', marker='s',
+             markersize=3)
 
-    # 4. Add Canine-Specific Thresholds
-    plt.axhline(y=CGM_MIN, color='green', linestyle=':', label=f'Low Target ({CGM_MIN})')
-    plt.axhline(y=CGM_MAX, color='orange', linestyle=':', label=f'High Target ({CGM_MAX})')
+    if actuals_results:
+        plt.plot(actuals_results['times'], actuals_results['actuals'],
+                 label='Actual CGM (Ground Truth)', color='green', linestyle='-', marker='x', markersize=4)
+        plt.title(f"Poppy's Forecast vs Actuals\nRMSE: {actuals_results['rmse']:.2f} mg/dL")
+    else:
+        plt.title(f"Poppy's Glucose Forecast\nReading at: {last_time.strftime('%H:%M')}")
 
-    # NEW: Create a dynamic, timestamped title
-    formatted_time = last_time.strftime('%Y-%m-%d %H:%M')
-    plt.title(f"Poppy's Glucose Forecast\nLast Reading: {formatted_time}")
-
-    # Formatting
-    plt.xlabel("Time")
-    plt.ylabel("Glucose (mg/dL)")
+    plt.axhline(y=CGM_MIN, color='green', linestyle=':', alpha=0.5)
+    plt.axhline(y=CGM_MAX, color='orange', linestyle=':', alpha=0.5)
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
+    plt.show()
 
-    # Optional: Save the plot automatically
-    # plt.savefig(f"forecast_{last_time.strftime('%Y%m%d_%H%M')}.png")
+    # --- NEW: Text Visualization for Gemini ---
+    print("\n" + "=" * 30)
+    print("DATA SUMMARY FOR VALIDATION")
+    print("=" * 30)
+
+    # 1. Blue: Last 10 points of history (to see the entry trend)
+    history_vals = recent_df['glucose'].tail(10).values.round(1)
+    print(f"BLUE (History - Last 10): {history_vals.tolist()}")
+
+    # 2. Red: The 120-minute forecast
+    print(f"RED  (Forecast):           {forecast_array.round(1).tolist()}")
+
+    # 3. Green: The actuals (if available)
+    if actuals_results is not None:
+        actual_vals = actuals_results['actuals'].round(1)
+        print(f"GREEN (Actuals):            {actual_vals.tolist()}")
+
+        # Calculate point-by-point error for context
+        min_len = min(len(forecast_array), len(actual_vals))
+        errors = (forecast_array[:min_len] - actual_vals[:min_len]).round(1)
+        print(f"ERROR (Red minus Green):   {errors.tolist()}")
+
+    print("=" * 30 + "\n")
 
     plt.show()
 
+
 if __name__ == "__main__":
-    Predict()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--time", type=str)
+    parser.add_argument("--device", type=str)
+    parser.add_argument("--validate", action="store_true")
+    args = parser.parse_args()
+
+    final_time = time_spec(args.time)
+    Predict(prediction_time=final_time, device_arg=args.device, validate=args.validate )
