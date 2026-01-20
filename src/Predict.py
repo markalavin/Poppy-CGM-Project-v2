@@ -13,21 +13,29 @@ from Validate import validate_prediction
 from Logging import log_prediction
 from Get_Prediction_Data import get_glucose_data_from_api, get_recent_records
 from Application_Parameters import INPUT_SAMPLES, PREDICTION_SAMPLES, CGM_MIN, CGM_MAX
+from Model_Architecture import PoppyLSTMModel
 
 
-# 1. MODEL ARCHITECTURE
-class PoppyLSTMModel(nn.Module):
-    def __init__(self, input_size=7, hidden_size=64, num_layers=2, output_size=12):
-        super(PoppyLSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_size)
+def get_autoregressive_forecast(model, input_seq, horizon):
+    model.eval()
+    current_window = input_seq.clone()
+    forecasts = []
 
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :])
-        return out
+    with torch.no_grad():
+        for i in range(horizon):
+            prediction = model(current_window)
+            val = prediction.item()
+            forecasts.append(val)
 
+            # Shift window: Template from the last row
+            last_row = current_window[:, -1:, :].clone()
+            last_row[0, 0, 0] = val  # Update Glucose
 
+            # Slide: [1, 35, 7] + [1, 1, 7]
+            current_window = torch.cat((current_window[:, 1:, :], last_row), dim=1)
+    return forecasts
+
+# 1. <deleted>
 # 2. DATA HELPERS
 def merge_records_to_context(glucose_df, records_df):
     merged_df = glucose_df.copy()
@@ -75,7 +83,9 @@ def Predict(prediction_time=None, device_arg=None, validate=False):
             return
 
     # Load Model
-    model = PoppyLSTMModel(input_size=7, output_size=PREDICTION_SAMPLES).to(device)
+    model = PoppyLSTMModel(input_size=7, hidden_size=64, num_layers=2).to(device)
+    # Force the output layer to 1 to match our 'Physiology' training
+    model.fc = torch.nn.Linear(64, 1)
     search_pattern = os.path.join("src", "poppy_model_*.pth*")
     list_of_files = glob.glob(search_pattern) or glob.glob("poppy_model_*.pth*")
 
@@ -84,7 +94,13 @@ def Predict(prediction_time=None, device_arg=None, validate=False):
         return
 
     latest_model = max(list_of_files, key=os.path.getctime)
-    model.load_state_dict(torch.load(latest_model, map_location=device))
+    print(f"Loading weights from: {latest_model}")
+
+    # map_location='cpu' forces the GPU weights to be moved to system RAM
+    model.load_state_dict(torch.load(latest_model, map_location=torch.device('cpu')))
+
+    # One final push to make sure EVERY layer (including convolutions) is on CPU
+    model.to(torch.device('cpu'))
     model.eval()
 
     # Data Fetching
@@ -96,7 +112,9 @@ def Predict(prediction_time=None, device_arg=None, validate=False):
     glucose_df = get_glucose_data_from_api(email='markalavin@gmail.com', password='my$Poppy$Dog1')
 
     # Filter glucose_df to only include readings UP TO the anchor_time
-    glucose_df = glucose_df[glucose_df['time'] <= anchor_time].tail(INPUT_SAMPLES)
+    # We keep 96 samples (8 hours) for the plot's blue line,
+    # but we will still only feed 36 to the model later.
+    glucose_df = glucose_df[glucose_df['time'] <= anchor_time].tail(96)
 
     print(f"Step 5: Fetching recent records leading up to {anchor_time}...")
     # Pass anchor_time here so the console prompt asks about the correct 6-hour window
@@ -112,31 +130,31 @@ def Predict(prediction_time=None, device_arg=None, validate=False):
     print("Step 7: Preparing input tensor...")
 
     # We use .tail(INPUT_SAMPLES) to get the exact window needed
-    input_tensor = prepare_tensor(merged_df.tail(INPUT_SAMPLES)).to(device)
+    input_tensor = prepare_tensor(merged_df.tail(INPUT_SAMPLES)).cpu()
 
-    # Step 8: Running Inference
-    print("Step 8: Running Inference...")
-    with torch.no_grad():
-        prediction_tensor = model(input_tensor)
+    # Step 8: Running Inference (Autoregressive)
+    print(f"Step 8: Generating {PREDICTION_SAMPLES}-step forecast...")
 
-    # De-normalize
-    forecast_array = (prediction_tensor.cpu().numpy().flatten() * 350.0) + 50.0
+    # 1. Run the loop FIRST to get the scaled values
+    forecast_scaled = get_autoregressive_forecast(model, input_tensor, PREDICTION_SAMPLES)
 
-    # Log the prediction
+    # 2. THEN convert those values to mg/dL
+    forecast_array = (np.array(forecast_scaled) * 350.0) + 50.0
+    # 1. Log the results (Passing the whole 2-hour array)
     log_prediction(current_glucose=merged_df['glucose'].iloc[-1], forecast_array=forecast_array)
 
-    # Validate if requested
+    # 2. Validation (Checking the full 2-hour forecast against ground truth)
     actuals_results = None
     if validate:
+        print("Step 9: Validating 2-hour forecast against actual CGM data...")
         actuals_results = validate_prediction(prediction_time, forecast_array,
                                               email='markalavin@gmail.com',
                                               password='my$Poppy$Dog1')
 
-    # Plot
-    plot_forecast(merged_df, forecast_array, actuals_results)
+    # 3. Final Visualization
+    plot_forecast(merged_df, forecast_array, model, actuals_results)
 
-
-def plot_forecast(recent_df, forecast_array, actuals_results=None):
+def plot_forecast(recent_df, forecast_array, model, actuals_results=None):
     plt.figure(figsize=(12, 6))
     last_time = recent_df['time'].iloc[-1]
     forecast_times = [last_time + pd.Timedelta(minutes=5 * (i + 1)) for i in range(len(forecast_array))]
@@ -156,6 +174,12 @@ def plot_forecast(recent_df, forecast_array, actuals_results=None):
     plt.axhline(y=CGM_MAX, color='orange', linestyle=':', alpha=0.5)
     plt.legend()
     plt.grid(True, alpha=0.3)
+
+    # Temporary Weight Inspector
+    # Access the weight of the insulin_conv layer specifically
+    with torch.no_grad():
+        insulin_weights = model.phys_layer.insulin_conv.weight.cpu().numpy().flatten()
+        print(f"\nLEARNED INSULIN CURVE (First 24): {insulin_weights[:24].round(3).tolist()}")
     plt.show()
 
     # --- NEW: Text Visualization for Gemini ---

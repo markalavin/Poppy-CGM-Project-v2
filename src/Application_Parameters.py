@@ -32,3 +32,6 @@ PREDICTION_HISTORY_FILE = '../data/prediction_history.csv'
 CGM_MIN = 50.0
 CGM_MAX = 400.0
 CGM_RANGE = CGM_MAX - CGM_MIN
+
+# Details of algorthms:
+TRAINING_EPOCHS = 200

@@ -1,140 +1,71 @@
-import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from Model_Architecture import PoppyLSTMModel
-from Merge_Poppy_Data import merge_poppy_data
-from Process_CGM_Data import processLibreViewCSV
-from Process_Report_Data import processLibreReportsCSV
-from Check_Input_Tensors import construct_input_tensors
-from Check_Input_Tensors import normalize_tensors
-from Application_Parameters import INPUT_SAMPLES, PREDICTION_SAMPLES, HIDDEN_SIZE, NUM_LAYERS
-import time
-import sys
-import torch.optim as optim
+import argparse
+from torch.utils.data import DataLoader
+from Model_Architecture import PoppyPredictor
+from Poppy_Dataset import PoppyDataset
+from Application_Parameters import TRAINING_EPOCHS
 
 
-def train_model(X, y, epochs=200, batch_size=32, lr=0.001, device = None):
-    """
-    Trains the PoppyLSTM model using a Learning Rate Scheduler
-    and saves the best performing version of the weights.
-    """
-    # 1. Hardware Setup
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on device: {device}")
+def train_model(until_date='2026-01-10'):
+    # 1. Hardware Check
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    # 2. Data Preparation
-    # Ensure y is 2D [Batch, 1] and everything is a Float on the GPU
-    if len(y.shape) == 1:
-        y = y.unsqueeze(1)
+    # 2. Dataset Initialization
+    # The until_date ensures we don't train on the last 9 days of "silent" records
+    WINDOW_SIZE = 160
+    dataset = PoppyDataset(
+        cgm_file='../data/Poppy CGM.csv',
+        events_file='../data/Poppy Reports.csv',
+        window_size=WINDOW_SIZE,
+        until_date=until_date
+    )
 
-    X_train = X.to(device).float()
-    y_train = y.to(device).float()
+    # High batch size for GPU efficiency
+    loader = DataLoader(dataset, batch_size=1024, shuffle=True)
 
-    dataset = TensorDataset(X_train, y_train)
-    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    # 3. Model Initialization
-    # input_size=7 matches your features: Glucose, Insulin, 3 Carbs, 2 Time
-    model = PoppyLSTMModel(input_size=7).to(device)
+    # 3. Model Setup (input_size=2 for Glucose + Metabolic Pressure)
+    model = PoppyPredictor(input_size=2).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    # 4. Scheduler & Tracking Logic
-    # patience=10: wait 10 epochs before cutting LR in half
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
-    best_loss = float('inf')
-    # Create a unique name like: poppy_model_20241012_1430.pth
-    timestamp = time.strftime("%Y%m%d_%H%M")
-    model_path = f"../src/poppy_model_{timestamp}.pth"
+    print(f"🚀 Training starting on {len(dataset)} samples...")
 
-    print(f"Starting training for {epochs} epochs...")
-
-    # 5. The Training Loop
-    for epoch in range(epochs):
+    # 4. Training Loop
+    # 50 epochs is a good baseline for the refined dataset
+    for epoch in range( TRAINING_EPOCHS ):
         model.train()
-        total_loss = 0
+        epoch_loss = 0
 
-        for batch_X, batch_y in train_loader:
-            optimizer.zero_grad()  # Reset gradients
-            outputs = model(batch_X)  # Forward pass
-            loss = criterion(outputs, batch_y)  # Calculate error
-            loss.backward()  # Backward pass
-            optimizer.step()  # Update weights
+        for x_batch, y_batch in loader:
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
 
-            total_loss += loss.item()
+            optimizer.zero_grad()
+            output = model(x_batch)
+            loss = criterion(output.squeeze(), y_batch)
+            loss.backward()
+            optimizer.step()
 
-        avg_loss = total_loss / len(train_loader)
-
-        # Step the scheduler based on the average loss
-        scheduler.step(avg_loss)
-
-        # Save if this is the best version we've seen so far
-        save_msg = ""
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            torch.save(model.state_dict(), model_path)
-            save_msg = "--> Best Model Saved!"
+            epoch_loss += loss.item()
 
         # Print progress every 5 epochs
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            current_lr = optimizer.param_groups[0]['lr']
-            print(f'Epoch [{epoch + 1}/{epochs}], Loss: {avg_loss:.6f}, LR: {current_lr} {save_msg}')
+        if (epoch + 1) % 5 == 0:
+            avg_loss = epoch_loss / len(loader)
+            print(f"✅ Epoch {epoch + 1}/{TRAINING_EPOCHS} | Loss: {avg_loss:.2f}")
 
-    print(f"\nTraining Complete!")
-    print(f"Model stored in", model_path )
-    print(f"Final Best Loss: {best_loss:.6f}")
-    print(f"Final best RMSE re-scaled: {math.sqrt( best_loss ) * CGM_RANGE }")
-
-    # Load the best weights back into the model before returning
-    model.load_state_dict(torch.load(model_path))
-    return model
-
-def Train(device_arg='cuda'):
-
-    start_ms = time.time()
-
-    # Check if the requested device is available, else fallback to CPU
-    device = torch.device(device_arg if torch.cuda.is_available() else 'cpu')
-    print(f"--- Training initiated on device: {device} ---")
-
-    X, y = construct_input_tensors()
-    # 0.1 Normalize the training data so most features lie in the range 0 - 1:
-    X_scaled, y_scaled = normalize_tensors(X, y)
-
-    # 0.2 Verify normalization (check if max is ~1.0)
-    print(f"Normalization check:  Max X Glucose: {X_scaled[:, :, 0].max()}")
-    print(f"Normalization check:  Max y Glucose: {y_scaled.max()}")
-
-    # 1. Grab the first window and move to CPU
-    # Format: [window_index, all_time_steps, all_features]
-    first_window = X_scaled[0].cpu()
-
-    # 2. Print the first 5 time steps of all 7 features
-    print("--- First 5 Time Steps of Window 0 ---")
-    print(first_window[:5, :])
-
-    # 3. Specifically check Glucose (Column 0) and Insulin (Column 1)
-    glucose_column = first_window[:, 0]
-    insulin_column = first_window[:, 1]
-
-    print(f"\nGlucose Range in this window: {glucose_column.min():.4f} to {glucose_column.max():.4f}")
-    print(f"Insulin Range in this window: {insulin_column.min():.4f} to {insulin_column.max():.4f}")
-
-    train_model( X_scaled, y_scaled, epochs = 200, device = device )
-
-    print( f"Training took {time.time() - start_ms} seconds")
+    # 5. Save the result
+    model_name = "poppy_model_v2.pth"
+    torch.save(model.state_dict(), model_name)
+    print(f"📂 Training Complete. Model saved to {model_name}")
 
 
 if __name__ == "__main__":
-    # Check if a device argument was provided (sys.argv[1])
-    # len(sys.argv) will be 2 if one argument is passed
-    if len(sys.argv) > 1:
-        device_selection = sys.argv[1].lower()
-    else:
-        # Default to 'cuda' if no argument is provided
-        device_selection = 'cuda'
+    parser = argparse.ArgumentParser(description="Train Poppy's Metabolic Predictor")
+    # Change '2024-01-10' to '2026-01-10', end date of original tranche of data:
+    parser.add_argument('--until', type=str, default='2026-01-10',
+                        help='Cutoff date for training (YYYY-MM-DD)')
 
-    Train(device_selection)
+    args = parser.parse_args()
+    train_model(until_date=args.until)
