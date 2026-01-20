@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import Dataset
 import pandas as pd
 import numpy as np
-
+from sklearn.preprocessing import MinMaxScaler
 
 class PoppyDataset(Dataset):
     def __init__(self, cgm_file, events_file, window_size=160, predict_ahead=30, until_date='2024-01-10'):
@@ -59,7 +59,9 @@ class PoppyDataset(Dataset):
                     if idx + i < len(self.cgm):
                         impact = 15.0 * np.exp(-i / 8.0)
                         self.cgm.iloc[idx + i, self.cgm.columns.get_loc('Metabolic_Pressure')] += impact
-
+        # 5. Initialize the Scaler and Scale Glucose
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
+        self.cgm['Glucose'] = self.scaler.fit_transform(self.cgm[['Glucose']].values)
         print(f"✅ Pre-processing complete. Data is ready for training.")
 
     def __len__(self):

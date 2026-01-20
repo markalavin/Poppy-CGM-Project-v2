@@ -53,10 +53,11 @@ def train_model(until_date='2026-01-10'):
         # Print progress every 5 epochs
         if (epoch + 1) % 5 == 0:
             avg_loss = epoch_loss / len(loader)
-            print(f"✅ Epoch {epoch + 1}/{TRAINING_EPOCHS} | Loss: {avg_loss:.2f}")
-
+            # Get current LR from the optimizer
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f'Epoch [{epoch + 1}/{TRAINING_EPOCHS}], Loss: {loss.item():.6f}, LR: {current_lr:.6f}')
     # 5. Save the result
-    model_name = "poppy_model_v2.pth"
+    model_name = "poppy_v2_scaled_baseline.pth"
     torch.save(model.state_dict(), model_name)
     print(f"📂 Training Complete. Model saved to {model_name}")
 
